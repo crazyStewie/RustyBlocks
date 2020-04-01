@@ -10,3 +10,10 @@ edition = "2018"
 specs = "0.16.1"
 serde = "1.0.105"
 raylib = { git = "https://github.com/deltaphc/raylib-rs", branch = "master" }
+vulkano = "0.18.0"
+vulkano-glfw = "0.5.0"
+vk-sys = "0.5.1"
+
+[dependencies.glfw]
+version = "0.37.0"
+features = ["vulkan"]

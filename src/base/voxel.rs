@@ -5,7 +5,7 @@ pub const CHUNK_SIZE : usize = 64;
 
 type BlockData = bool;
 
-struct  ChunkData([BlockData; CHUNK_SIZE*CHUNK_SIZE*CHUNK_SIZE]);
+pub struct ChunkData([BlockData; CHUNK_SIZE*CHUNK_SIZE*CHUNK_SIZE]);
 
 impl ChunkData {
     pub fn new() -> Self {
@@ -44,6 +44,10 @@ impl ChunkData {
         let z = (pos - y*CHUNK_SIZE - x*CHUNK_SIZE*CHUNK_SIZE)%CHUNK_SIZE;
         return (x, y, z);
     }
+    //TODO
+    //unsafe fn generate_mesh(&self) -> Mesh {
+    //    return mesh;
+    //}
 }
 
 struct ChunkComponent {
@@ -53,4 +57,8 @@ struct ChunkComponent {
 
 impl Component for ChunkComponent {
     type Storage = VecStorage<Self>;
+}
+
+struct VoxelSystem{
+
 }
