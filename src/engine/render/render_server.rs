@@ -5,29 +5,54 @@ use std::sync::Arc;
 use std::ffi::CString;
 use raylib::rgui::DrawResult::Selected;
 use vulkano::VulkanObject;
-use glfw::{Context, Window};
+use glfw::{Context};
 use std::ptr::null;
 use std::borrow::Borrow;
 use vulkano::instance::PhysicalDevice;
-use vulkano::swapchain::{SupportedPresentModes, PresentMode, Capabilities, Swapchain, CompositeAlpha, FullscreenExclusive, Surface};
+use vulkano::swapchain::{SupportedPresentModes, PresentMode, Capabilities, Swapchain, CompositeAlpha, FullscreenExclusive, Surface, acquire_next_image};
 use vulkano::image::{SwapchainImage, ImageUsage};
-use vulkano::sync::SharingMode;
-use vulkano::device::DeviceExtensions;
+use vulkano::sync::{SharingMode, GpuFuture};
+use vulkano::device::{DeviceExtensions, Device};
+use vulkano::pipeline::viewport::Viewport;
+use vulkano::pipeline::GraphicsPipeline;
+use vulkano::pipeline::vertex::{BufferlessDefinition, BufferlessVertices};
+use vulkano::framebuffer::{RenderPassAbstract, Subpass, FramebufferAbstract, Framebuffer};
+use vulkano::descriptor::PipelineLayoutAbstract;
+use std::ops::{Deref, DerefMut};
+use vulkano::command_buffer::{AutoCommandBuffer, AutoCommandBufferBuilder, DynamicState};
+use vulkano::pipeline::raster::DepthBiasControl::Dynamic;
 
 #[cfg(all(debug_assertions))]
 const ENABLE_VALIDATION_LAYERS: bool = true;
 #[cfg(not(debug_assertions))]
-const ENABLE_VALIDATION_LAYERS: bool = true;
+const ENABLE_VALIDATION_LAYERS: bool = false;
 
 const VALIDATION_LAYERS: &[&str] = &[
     "VK_LAYER_LUNARG_standard_validation"
 ];
 
+//TODO, FIXME
+struct Window (glfw::Window);
+impl Deref for Window {
+    type Target = glfw::Window;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Window {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+unsafe impl Send for Window{}
+unsafe impl Sync for Window{}
 pub struct RenderServer {
     glfw : glfw::Glfw,
     events: Receiver<(f64, glfw::WindowEvent)>,
 
-    surface: Arc<vulkano::swapchain::Surface<glfw::Window>>,
+    surface: Arc<vulkano::swapchain::Surface<Window>>,
 
     instance : Arc<vulkano::instance::Instance>,
     debug_callback: Option<vulkano::instance::debug::DebugCallback>,
@@ -38,8 +63,14 @@ pub struct RenderServer {
     graphics_queue: Arc<vulkano::device::Queue>,
     present_queue: Arc<vulkano::device::Queue>,
 
-    swap_chain: Arc<vulkano::swapchain::Swapchain<glfw::Window>>,
-    swap_chain_images: Vec<Arc<vulkano::image::SwapchainImage<glfw::Window>>>,
+    swap_chain: Arc<vulkano::swapchain::Swapchain<Window>>,
+    swap_chain_images: Vec<Arc<vulkano::image::SwapchainImage<Window>>>,
+
+    render_pass: Arc<dyn RenderPassAbstract + Send + Sync>,
+    graphics_pipeline: Arc<GraphicsPipeline<BufferlessDefinition, Box<dyn PipelineLayoutAbstract + Send + Sync + 'static>, Arc<dyn RenderPassAbstract + Send + Sync + 'static>>>,
+
+    swap_chain_framebuffers: Vec<Arc<dyn FramebufferAbstract + Send + Sync>>,
+    command_buffers: Vec<Arc<AutoCommandBuffer>>,
 }
 
 impl RenderServer {
@@ -128,8 +159,7 @@ impl RenderServer {
     }
 
     fn create_logical_device(instance: &Arc<vulkano::instance::Instance>, device_index: usize)
-        -> (Arc<vulkano::device::Device>, Arc<vulkano::device::Queue>, Arc<vulkano::device::Queue>)
-    {
+        -> (Arc<vulkano::device::Device>, Arc<vulkano::device::Queue>, Arc<vulkano::device::Queue>) {
         let physical_device = vulkano::instance::PhysicalDevice::from_index(instance, device_index).unwrap();
         let queue_family = physical_device.queue_families().find(|&q| {
             q.supports_graphics()
@@ -146,7 +176,7 @@ impl RenderServer {
         return (device, graphics_queue, present_queue);
     }
 
-    fn create_surface(instance: &Arc<vulkano::instance::Instance>, window : glfw::Window) -> Arc<vulkano::swapchain::Surface<glfw::Window>> {
+    fn create_surface(instance: &Arc<vulkano::instance::Instance>, window : Window) -> Arc<vulkano::swapchain::Surface<Window>> {
         let mut internal_surface: vk_sys::SurfaceKHR = 0;
         let result = unsafe {
             glfw::ffi::glfwCreateWindowSurface(
@@ -222,12 +252,12 @@ impl RenderServer {
 
     fn create_swap_chain(
         instance: &Arc<vulkano::instance::Instance>,
-        surface: &Arc<vulkano::swapchain::Surface<glfw::Window>>,
+        surface: &Arc<vulkano::swapchain::Surface<Window>>,
         physical_device_index: usize,
         device: &Arc<vulkano::device::Device>,
         graphics_queue: &Arc<vulkano::device::Queue>,
         present_queue: &Arc<vulkano::device::Queue>,
-    ) -> (Arc<vulkano::swapchain::Swapchain<glfw::Window>>, Vec<Arc<SwapchainImage<glfw::Window>>>) {
+    ) -> (Arc<vulkano::swapchain::Swapchain<Window>>, Vec<Arc<SwapchainImage<Window>>>) {
         let physical_device = PhysicalDevice::from_index(instance, physical_device_index).unwrap();
         let capabilities = surface.capabilities(physical_device)
             .expect("Failed to get surfaqce capabilities");
@@ -272,13 +302,119 @@ impl RenderServer {
         (swap_chain, images)
     }
 
+    fn create_graphics_pipeline(device: &Arc<Device>, swap_chain_extent: [u32; 2], render_pass: &Arc<dyn RenderPassAbstract + Send + Sync>)
+    -> Arc<GraphicsPipeline<BufferlessDefinition, Box<dyn PipelineLayoutAbstract + Send + Sync + 'static>, Arc<dyn RenderPassAbstract + Send + Sync + 'static>>> {
+        mod vertex_shader {
+            vulkano_shaders::shader! {
+                ty: "vertex",
+                path: "src/engine/render/shaders/default_shader.vert"
+            }
+        }
+
+        mod fragment_shader {
+            vulkano_shaders::shader! {
+                ty: "fragment",
+                path: "src/engine/render/shaders/default_shader.frag"
+            }
+        }
+
+        let vert_shader_module = vertex_shader::Shader::load(device.clone())
+            .expect("failed to create vertex shader module!");
+        let frag_shader_module = fragment_shader::Shader::load(device.clone())
+            .expect("failed to create fragment shader module");
+
+        let dimensions = [swap_chain_extent[0] as f32, swap_chain_extent[1] as f32];
+        let viewport = Viewport {
+            origin: [0.0, 0.0],
+            dimensions,
+            depth_range: 0.0 .. 1.0,
+        };
+
+        return Arc::new(GraphicsPipeline::start()
+            .vertex_input(BufferlessDefinition {})
+            .vertex_shader(vert_shader_module.main_entry_point(), ())
+            .triangle_list()
+            .primitive_restart(false)
+            .viewports(vec![viewport])
+            .fragment_shader(frag_shader_module.main_entry_point(), ())
+            .depth_clamp(false)
+            .polygon_mode_fill()
+            .line_width(1.0)
+            .cull_mode_back()
+            .front_face_clockwise()
+            .blend_pass_through()
+            .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
+            .build(device.clone())
+            .unwrap());
+    }
+
+    fn create_render_pass(device: &Arc<Device>, color_format: vulkano::format::Format) -> Arc<dyn RenderPassAbstract + Send + Sync> {
+        Arc::new(vulkano::single_pass_renderpass!(device.clone(),
+            attachments: {
+                color: {
+                    load: Clear,
+                    store: Store,
+                    format: color_format,
+                    samples: 1,
+                }
+            },
+            pass: {
+                color: [color],
+                depth_stencil: {}
+            }
+        ).unwrap())
+    }
+
+    fn create_framebuffers(swap_chain_images: &[Arc<SwapchainImage<Window>>], render_pass: &Arc<dyn RenderPassAbstract + Send + Sync>)
+    -> Vec<Arc<dyn FramebufferAbstract + Send + Sync>> {
+        swap_chain_images.iter().map(|image| {
+            let fba : Arc<dyn FramebufferAbstract + Send + Sync> = Arc::new(Framebuffer::start(render_pass.clone())
+                .add(image.clone()).unwrap()
+                .build().unwrap());
+            fba
+            }
+        ).collect::<Vec<_>>()
+    }
+
+    fn create_command_buffers(&mut self) {
+        let queue_family = self.graphics_queue.family();
+        self.command_buffers = self.swap_chain_framebuffers.iter().map(|framebuffer| {
+            let vertices = BufferlessVertices {vertices: 3, instances: 1};
+            Arc::new(AutoCommandBufferBuilder::primary_simultaneous_use(self.device.clone(), queue_family)
+                .unwrap()
+                .begin_render_pass(framebuffer.clone(), false, vec![[0.0, 0.0, 0.0, 1.0].into()])
+                .unwrap()
+                .draw(self.graphics_pipeline.clone(), &DynamicState::none(), vertices, (), ())
+                .unwrap()
+                .end_render_pass()
+                .unwrap()
+                .build()
+                .unwrap())
+        }).collect();
+    }
+
+    fn draw_frame(&mut self) {
+        let (image_index,acquisition_suboptimal, acquire_future) = acquire_next_image(self.swap_chain.clone(), None).unwrap();
+
+        let command_buffer = self.command_buffers[image_index].clone();
+
+        let future = acquire_future
+            .then_execute(self.graphics_queue.clone(), command_buffer)
+            .unwrap()
+            .then_swapchain_present(self.present_queue.clone(), self.swap_chain.clone(), image_index)
+            .then_signal_fence_and_flush()
+            .unwrap();
+
+        future.wait(None).unwrap();
+    }
+
     pub fn new() -> Self {
         //Initializing GLFW
         let mut glfw = glfw::init(glfw::FAIL_ON_ERRORS).unwrap();
         glfw.window_hint(glfw::WindowHint::ClientApi(glfw::ClientApiHint::NoApi));
         let (mut window, events) = glfw.create_window(800, 600, "Rusty Blocks", glfw::WindowMode::Windowed)
             .expect("Unable to create window");
-
+        let mut window = Window(window);
         window.set_key_polling(true);
 
         //Initializing Vulkano
@@ -287,9 +423,12 @@ impl RenderServer {
         let debug_callback = Self::create_debug_callback(&instance);
         let physical_device_index = Self::pick_physical_device(&instance, &surface);
         let (device, graphics_queue, present_queue) = Self::create_logical_device(&instance, physical_device_index);
-
         let (swap_chain, swap_chain_images) = Self::create_swap_chain(&instance, &surface, physical_device_index, &device, &graphics_queue, &present_queue);
-        Self{
+        let render_pass = Self::create_render_pass(&device, swap_chain.format());
+        let graphics_pipeline = Self::create_graphics_pipeline(&device, swap_chain.dimensions(), &render_pass);
+        let swap_chain_framebuffers = Self::create_framebuffers(&swap_chain_images, &render_pass);
+
+        let mut render_server= Self{
             glfw,
             events,
             instance,
@@ -301,12 +440,20 @@ impl RenderServer {
             swap_chain,
             surface,
             swap_chain_images,
-        }
+            render_pass,
+            graphics_pipeline,
+            swap_chain_framebuffers,
+            command_buffers: vec![],
+        };
+
+        render_server.create_command_buffers();
+        return render_server;
     }
 
     pub fn render_loop(&mut self) {
         println!("Looping");
         while !self.surface.window().should_close() {
+            self.draw_frame();
             self.glfw.poll_events();
         }
     }
